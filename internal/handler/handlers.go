@@ -1125,6 +1125,118 @@ func TriggerTelegramScheduler(svr server.Server, jobRepo *job.Repository) http.H
 	)
 }
 
+const linkedinPostsAPIEndpoint = "https://api.linkedin.com/rest/posts"
+
+type linkedinPostRequest struct {
+	Author                    string                   `json:"author"`
+	Commentary                string                   `json:"commentary"`
+	Visibility                string                   `json:"visibility"`
+	Distribution              linkedinPostDistribution `json:"distribution"`
+	LifecycleState            string                   `json:"lifecycleState"`
+	IsReshareDisabledByAuthor bool                     `json:"isReshareDisabledByAuthor"`
+}
+
+type linkedinPostDistribution struct {
+	FeedDistribution               string        `json:"feedDistribution"`
+	TargetEntities                 []interface{} `json:"targetEntities"`
+	ThirdPartyDistributionChannels []interface{} `json:"thirdPartyDistributionChannels"`
+}
+
+func linkedinJobPostText(svr server.Server, j *job.JobPost) string {
+	return fmt.Sprintf("%s with %s - %s | %s\n\n#%s #%sjobs\n\n%s%s/job/%s", j.JobTitle, j.Company, j.Location, j.SalaryRange, svr.GetConfig().SiteJobCategory, svr.GetConfig().SiteJobCategory, svr.GetConfig().URLProtocol, svr.GetConfig().SiteHost, j.Slug)
+}
+
+func postLinkedInPost(ctx context.Context, client *http.Client, endpoint string, accessToken string, linkedInVersion string, authorURN string, commentary string) error {
+	payload := linkedinPostRequest{
+		Author:     authorURN,
+		Commentary: commentary,
+		Visibility: "PUBLIC",
+		Distribution: linkedinPostDistribution{
+			FeedDistribution:               "MAIN_FEED",
+			TargetEntities:                 []interface{}{},
+			ThirdPartyDistributionChannels: []interface{}{},
+		},
+		LifecycleState:            "PUBLISHED",
+		IsReshareDisabledByAuthor: false,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("LinkedIn-Version", linkedInVersion)
+	req.Header.Set("X-Restli-Protocol-Version", "2.0.0")
+
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+		resBody, _ := ioutil.ReadAll(res.Body)
+		return fmt.Errorf("linkedin post failed with status %d: %s", res.StatusCode, string(resBody))
+	}
+	return nil
+}
+
+func TriggerLinkedInShareJobs(svr server.Server, jobRepo *job.Repository) http.HandlerFunc {
+	return middleware.MachineAuthenticatedMiddleware(
+		svr.GetConfig().MachineToken,
+		func(w http.ResponseWriter, r *http.Request) {
+			go func() {
+				cfg := svr.GetConfig()
+				if strings.TrimSpace(cfg.LinkedInAccessToken) == "" || strings.TrimSpace(cfg.LinkedInAuthorURN) == "" {
+					svr.Log(errors.New("linkedin sharing is not configured"), "LINKEDIN_ACCESS_TOKEN and LINKEDIN_AUTHOR_URN are required")
+					return
+				}
+				lastLinkedInJobIDStr, err := jobRepo.GetValue("last_linkedin_job_id")
+				if err != nil {
+					svr.Log(err, "unable to retrieve last linkedin job id")
+					return
+				}
+				lastLinkedInJobID, err := strconv.Atoi(lastLinkedInJobIDStr)
+				if err != nil {
+					svr.Log(err, "unable to convert linkedin job str to id")
+					return
+				}
+				jobPosts, err := jobRepo.GetLastNJobsFromID(cfg.TwitterJobsToPost, lastLinkedInJobID)
+				if err != nil {
+					svr.Log(err, "unable to retrieve jobs for linkedin sharing")
+					return
+				}
+				log.Printf("found %d/%d jobs to post on linkedin\n", len(jobPosts), cfg.TwitterJobsToPost)
+				if len(jobPosts) == 0 {
+					return
+				}
+				lastJobID := lastLinkedInJobID
+				client := http.DefaultClient
+				ctx := context.Background()
+				for _, j := range jobPosts {
+					if err := postLinkedInPost(ctx, client, linkedinPostsAPIEndpoint, cfg.LinkedInAccessToken, cfg.LinkedInVersion, cfg.LinkedInAuthorURN, linkedinJobPostText(svr, j)); err != nil {
+						svr.Log(err, "unable to post on linkedin")
+						continue
+					}
+					lastJobID = j.ID
+				}
+				lastJobIDStr := strconv.Itoa(lastJobID)
+				err = jobRepo.SetValue("last_linkedin_job_id", lastJobIDStr)
+				if err != nil {
+					svr.Log(err, fmt.Sprintf("unable to save last linkedin job id to db as %s", lastJobIDStr))
+					return
+				}
+				log.Printf("updated last linkedin job id to %s\n", lastJobIDStr)
+				log.Printf("posted last %d jobs to linkedin", len(jobPosts))
+			}()
+			svr.JSON(w, http.StatusOK, map[string]interface{}{"status": "ok"})
+		},
+	)
+}
+
 func TriggerMonthlyHighlights(svr server.Server, jobRepo *job.Repository) http.HandlerFunc {
 	return middleware.MachineAuthenticatedMiddleware(
 		svr.GetConfig().MachineToken,
