@@ -18,7 +18,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ChimeraCoder/anaconda"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/bot-api/telegram"
 	"github.com/dgrijalva/jwt-go"
@@ -1177,11 +1176,50 @@ func TriggerMonthlyHighlights(svr server.Server, jobRepo *job.Repository) http.H
 	)
 }
 
+const twitterCreateTweetAPIEndpoint = "https://api.x.com/2/tweets"
+
+type twitterCreateTweetRequest struct {
+	Text string `json:"text"`
+}
+
+func twitterJobPostText(svr server.Server, j *job.JobPost) string {
+	return fmt.Sprintf("%s with %s - %s | %s\n\n#%s #%sjobs\n\n%s%s/job/%s", j.JobTitle, j.Company, j.Location, j.SalaryRange, svr.GetConfig().SiteJobCategory, svr.GetConfig().SiteJobCategory, svr.GetConfig().URLProtocol, svr.GetConfig().SiteHost, j.Slug)
+}
+
+func postTwitterTweet(ctx context.Context, client *http.Client, endpoint string, bearerToken string, text string) error {
+	body, err := json.Marshal(twitterCreateTweetRequest{Text: text})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+bearerToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+		resBody, _ := ioutil.ReadAll(res.Body)
+		return fmt.Errorf("twitter post failed with status %d: %s", res.StatusCode, string(resBody))
+	}
+	return nil
+}
+
 func TriggerTwitterScheduler(svr server.Server, jobRepo *job.Repository) http.HandlerFunc {
 	return middleware.MachineAuthenticatedMiddleware(
 		svr.GetConfig().MachineToken,
 		func(w http.ResponseWriter, r *http.Request) {
 			go func() {
+				cfg := svr.GetConfig()
+				if strings.TrimSpace(cfg.TwitterBearerToken) == "" {
+					svr.Log(errors.New("twitter sharing is not configured"), "TWITTER_BEARER_TOKEN is required")
+					return
+				}
 				lastTwittedJobIDStr, err := jobRepo.GetValue("last_twitted_job_id")
 				if err != nil {
 					svr.Log(err, "unable to retrieve last twitter job id")
@@ -1192,16 +1230,16 @@ func TriggerTwitterScheduler(svr server.Server, jobRepo *job.Repository) http.Ha
 					svr.Log(err, "unable to convert job str to id")
 					return
 				}
-				jobPosts, err := jobRepo.GetLastNJobsFromID(svr.GetConfig().TwitterJobsToPost, lastTwittedJobID)
-				log.Printf("found %d/%d jobs to post on twitter\n", len(jobPosts), svr.GetConfig().TwitterJobsToPost)
+				jobPosts, err := jobRepo.GetLastNJobsFromID(cfg.TwitterJobsToPost, lastTwittedJobID)
+				log.Printf("found %d/%d jobs to post on twitter\n", len(jobPosts), cfg.TwitterJobsToPost)
 				if len(jobPosts) == 0 {
 					return
 				}
 				lastJobID := lastTwittedJobID
-				api := anaconda.NewTwitterApiWithCredentials(svr.GetConfig().TwitterAccessToken, svr.GetConfig().TwitterAccessTokenSecret, svr.GetConfig().TwitterClientKey, svr.GetConfig().TwitterClientSecret)
+				client := http.DefaultClient
+				ctx := context.Background()
 				for _, j := range jobPosts {
-					_, err := api.PostTweet(fmt.Sprintf("%s with %s - %s | %s\n\n#%s #%sjobs\n\n%s%s/job/%s", j.JobTitle, j.Company, j.Location, j.SalaryRange, svr.GetConfig().SiteJobCategory, svr.GetConfig().SiteJobCategory, svr.GetConfig().URLProtocol, svr.GetConfig().SiteHost, j.Slug), url.Values{})
-					if err != nil {
+					if err := postTwitterTweet(ctx, client, twitterCreateTweetAPIEndpoint, cfg.TwitterBearerToken, twitterJobPostText(svr, j)); err != nil {
 						svr.Log(err, "unable to post tweet")
 						continue
 					}
